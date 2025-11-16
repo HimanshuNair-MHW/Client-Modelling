@@ -103,99 +103,87 @@ def run_prophet(df, metric_col, control_cols, pre_period, post_period, holidays)
     pre_start, pre_end = pre_period
     post_start, post_end = post_period
 
-    # Slice
+    # Slice periods
     train = df.loc[pre_start:pre_end].copy()
     full = df.loc[pre_start:post_end].copy()
 
-    # Sanity check
-    if train.empty:
-        st.error("❌ Pre-period contains no data. Check date ranges.")
+    # --- SAFETY: check data exists ---
+    if len(train) < 14:
+        st.error("❌ Not enough data in pre-period (minimum 14 days).")
         st.stop()
 
-    if full.empty:
-        st.error("❌ Combined period contains no data. Check date ranges.")
-        st.stop()
-
-    # Drop rows where KPI is missing
-    if train[metric_col].isna().any():
-        train[metric_col] = train[metric_col].fillna(method="ffill")
-
-    if train[metric_col].isna().any():
-        st.error("❌ KPI has missing values even after forward-fill. Clean your data.")
-        st.stop()
-
-    # Prepare train + full dataframes
+    # Prepare Prophet input
     train_p = train.reset_index().rename(columns={"index": "ds", metric_col: "y"})
-    full_p = full.reset_index().rename(columns={"index": "ds"})
+    full_p  = full.reset_index().rename(columns={"index": "ds"})
 
-    # Enforce numeric KPI
+    # --- KPI CLEANING ---
     train_p["y"] = pd.to_numeric(train_p["y"], errors="coerce")
+    full_p["y"]  = pd.to_numeric(full_p["y"], errors="coerce")
 
-    if train_p["y"].isna().any():
-        st.error("❌ KPI column contains non-numeric values. Please fix the dataset.")
-        st.stop()
+    # Fill KPI gaps
+    train_p["y"] = train_p["y"].fillna(method="ffill").fillna(method="bfill").interpolate()
+    full_p["y"]  = full_p["y"].fillna(method="ffill").fillna(method="bfill").interpolate()
 
-    # Create Prophet model
+    # --- PROPHET MODEL INIT ---
     model = Prophet(
         weekly_seasonality=True,
         yearly_seasonality=True,
         daily_seasonality=False
     )
 
-    # Build holiday dataframe
+    # Add holidays
     hol = build_holiday_df(df.index, holidays)
     if hol is not None:
         model.holidays = hol
 
-    # Handle regressors safely
+    # --- CONTROL VARIABLE CLEANING ---
+    cleaned_controls = []
+
     for c in control_cols:
-        # Convert control to numeric
-        train_p[c] = pd.to_numeric(train[c], errors="coerce")
-        full_p[c] = pd.to_numeric(full[c], errors="coerce")
 
-        # Check missing values in control
-        if train_p[c].isna().any():
-            st.warning(f"⚠️ Control variable '{c}' has missing values. Forward-filling.")
-            train_p[c] = train_p[c].fillna(method="ffill")
+        col_train_raw = train[c].copy()
+        col_full_raw  = full[c].copy()
 
-        if train_p[c].isna().any():
-            st.error(f"❌ Control variable '{c}' contains non-numeric values. Clean your data.")
-            st.stop()
+        # Convert everything to numeric
+        train_clean = pd.to_numeric(col_train_raw, errors="coerce")
+        full_clean  = pd.to_numeric(col_full_raw,  errors="coerce")
 
+        # Try filling missing values intelligently
+        train_clean = train_clean.fillna(method="ffill").fillna(method="bfill").interpolate()
+        full_clean  = full_clean.fillna(method="ffill").fillna(method="bfill").interpolate()
+
+        # If still completely NaN → drop control
+        if train_clean.isna().all():
+            st.warning(f"⚠️ Control '{c}' dropped because values were unusable.")
+            continue  
+
+        # Add to Prophet input
+        train_p[c] = train_clean.values
+        full_p[c]  = full_clean.values
         model.add_regressor(c)
+        cleaned_controls.append(c)
 
-    # Final check before fit: no NaNs allowed
-    if train_p.isna().any().any():
-        st.error("❌ Training dataframe still contains NaNs. Clean your dataset.")
-        st.stop()
-
-    # Prophet requires >= 14 days
-    if len(train_p) < 14:
-        st.error("❌ Prophet requires at least 14 consecutive days of pre-period data.")
-        st.stop()
-
-    # Fit model (this was the line causing the crash)
+    # --- FIT MODEL ---
     try:
         model.fit(train_p)
     except Exception as e:
-        st.error(f"❌ Prophet failed during fit(): {str(e)}")
+        st.error("❌ Prophet failed, even after auto-cleaning. Here is the error:")
+        st.error(str(e))
         st.stop()
 
-    # Forecast
+    # --- FORECAST ---
     forecast = model.predict(full_p).set_index("ds")
 
-    # Merge with actuals
     result = full[[metric_col]].join(
         forecast[["yhat", "yhat_lower", "yhat_upper"]],
         how="left"
     )
 
-    # Pre-period fit metrics
+    # --- METRICS ---
     pre_res = result.loc[pre_start:pre_end]
     rmse = np.sqrt(np.mean((pre_res[metric_col] - pre_res["yhat"]) ** 2))
     mape = np.mean(np.abs((pre_res[metric_col] - pre_res["yhat"]) / pre_res[metric_col])) * 100
 
-    # Impact
     post_res = result.loc[post_start:post_end].copy()
     post_res["impact"] = post_res[metric_col] - post_res["yhat"]
     post_res["cum_impact"] = post_res["impact"].cumsum()
@@ -203,6 +191,7 @@ def run_prophet(df, metric_col, control_cols, pre_period, post_period, holidays)
     metrics = {
         "rmse": rmse,
         "mape": mape,
+        "cleaned_controls": cleaned_controls,
         "uplift": post_res["impact"].sum(),
         "rel_uplift": (post_res["impact"].sum() / post_res["yhat"].sum() * 100)
     }
