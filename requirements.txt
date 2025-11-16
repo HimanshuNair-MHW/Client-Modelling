@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+prophet
+causalimpact
+plotly
+gspread
+oauth2client
+python-dateutil
