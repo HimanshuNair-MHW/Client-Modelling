@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import date, timedelta
-from io import StringIO
 from pathlib import Path
 
 from prophet import Prophet
@@ -12,27 +11,23 @@ from dateutil.easter import easter as easter_sunday
 
 
 # ==========================================================
-# Utility: robust date parsing + resampling to daily
+# Helpers: date + cleaning
 # ==========================================================
 
-def resample_to_daily(df: pd.DataFrame,
-                      date_col: str,
-                      freq_choice: str,
-                      agg_method: str) -> pd.DataFrame:
+def standardize_to_daily(df: pd.DataFrame,
+                         date_col: str,
+                         agg_method: str) -> pd.DataFrame:
     """
-    - Robustly parse the date column (day-first, tolerate garbage).
-    - Drop rows with unparseable dates.
-    - Aggregate duplicates.
-    - Resample to daily with forward fill.
+    Robustly parse date column, drop bad dates, aggregate duplicates,
+    and standardise to a daily DateTimeIndex with forward/back fill.
     """
-
     if date_col not in df.columns:
-        st.error(f"❌ Date column '{date_col}' not found in data.")
+        st.error(f"❌ Date column '{date_col}' not found.")
         st.stop()
 
     tmp = df.copy()
 
-    # Convert to string and strip junk
+    # Stringify and clean basic junk
     col = (
         tmp[date_col]
         .astype(str)
@@ -40,23 +35,21 @@ def resample_to_daily(df: pd.DataFrame,
         .replace({"": np.nan, "NaT": np.nan})
     )
 
-    # Parse dates with dayfirst=True, errors coerced to NaT (no crash)
+    # Parse dates (dayfirst to be friendly to UK/Europe)
     tmp[date_col] = pd.to_datetime(col, errors="coerce", dayfirst=True)
 
-    # Drop unparseable dates
-    bad_dates = tmp[date_col].isna().sum()
-    if bad_dates > 0:
-        st.warning(f"⚠️ {bad_dates} rows had invalid dates and were removed.")
+    bad = tmp[date_col].isna().sum()
+    if bad > 0:
+        st.warning(f"⚠ {bad} rows had invalid dates and were dropped.")
         tmp = tmp.dropna(subset=[date_col])
 
     if tmp.empty:
-        st.error("❌ No valid dates left after cleaning. Please check your date column.")
+        st.error("❌ No valid dates left after cleaning.")
         st.stop()
 
-    # Sort
     tmp = tmp.sort_values(date_col)
 
-    # Aggregate duplicates if needed
+    # Aggregate duplicates
     if tmp[date_col].duplicated().sum() > 0:
         if agg_method == "mean":
             tmp = tmp.groupby(date_col, as_index=False).mean(numeric_only=True)
@@ -65,20 +58,25 @@ def resample_to_daily(df: pd.DataFrame,
         else:
             tmp = tmp.groupby(date_col, as_index=False).first()
 
-    # Set index
     tmp = tmp.set_index(date_col).sort_index()
 
-    # Resample to daily regardless of original frequency
-    # (Daily, Weekly, Monthly all become daily)
-    tmp = tmp.resample("D").ffill()
+    # Build a complete daily index
+    full_idx = pd.date_range(tmp.index.min(), tmp.index.max(), freq="D")
+    tmp = tmp.reindex(full_idx)
+
+    # Fill gaps
     tmp = tmp.ffill().bfill()
 
     return tmp
 
 
-# ==========================================================
-# Holidays helper
-# ==========================================================
+def clean_series(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    s = s.replace([np.inf, -np.inf], np.nan)
+    s = s.ffill().bfill().interpolate()
+    s = s.fillna(0)
+    return s
+
 
 def build_holidays(index: pd.DatetimeIndex, flags: dict) -> pd.DataFrame | None:
     holidays = []
@@ -87,296 +85,283 @@ def build_holidays(index: pd.DatetimeIndex, flags: dict) -> pd.DataFrame | None:
     for y in years:
         if flags.get("Christmas", False):
             holidays.append({"ds": pd.Timestamp(f"{y}-12-25"), "holiday": "Christmas"})
-
         if flags.get("Black Friday", False):
-            nov = pd.date_range(f"{y}-11-01", f"{y}-11-30")
+            nov = pd.date_range(f"{y}-11-01", f"{y}-11-30", freq="D")
             fridays = [d for d in nov if d.weekday() == 4]
             if len(fridays) >= 4:
                 holidays.append({"ds": fridays[3], "holiday": "BlackFriday"})
-
         if flags.get("Easter", False):
-            es = pd.Timestamp(easter_sunday(y))
-            holidays.append({"ds": es, "holiday": "Easter"})
-
+            holidays.append({"ds": pd.Timestamp(easter_sunday(y)), "holiday": "Easter"})
         if flags.get("Cyber Monday", False):
-            nov = pd.date_range(f"{y}-11-01", f"{y}-11-30")
+            nov = pd.date_range(f"{y}-11-01", f"{y}-11-30", freq="D")
             fridays = [d for d in nov if d.weekday() == 4]
             if len(fridays) >= 4:
                 cm = fridays[3] + pd.Timedelta(days=3)
                 holidays.append({"ds": cm, "holiday": "CyberMonday"})
 
-    if not holidays:
-        return None
-
-    return pd.DataFrame(holidays)
+    return pd.DataFrame(holidays) if holidays else None
 
 
 # ==========================================================
-# Series cleaner for KPI + controls
+# Prophet: pure forecast (no uplift)
 # ==========================================================
 
-def clean_series(s: pd.Series) -> pd.Series:
-    s = pd.to_numeric(s, errors="coerce")
-    s = s.replace([np.inf, -np.inf], np.nan)
-    # Forward & backward fill, then interpolate, then zero-fill as last resort
-    s = s.fillna(method="ffill").fillna(method="bfill").interpolate()
-    s = s.fillna(0)
-    return s
+def run_prophet_forecast(df_daily: pd.DataFrame,
+                         metric_col: str,
+                         horizon_len: int,
+                         horizon_unit: str,
+                         holiday_flags: dict):
+    """
+    df_daily: daily-indexed dataframe with metric_col
+    horizon_unit: 'Daily', 'Weekly', 'Monthly'
+    """
 
+    df_daily = df_daily.sort_index()
+    base = df_daily[[metric_col]].copy()
 
-# ==========================================================
-# Prophet engine with hard safety firewall
-# ==========================================================
+    # Resample to modeling frequency
+    if horizon_unit == "Daily":
+        freq = "D"
+        series = base
+    elif horizon_unit == "Weekly":
+        freq = "W"
+        series = base.resample("W").mean()
+    else:  # Monthly
+        freq = "M"
+        series = base.resample("M").mean()
 
-def run_prophet(df: pd.DataFrame,
-                metric_col: str,
-                control_cols: list[str],
-                pre_period: tuple[pd.Timestamp, pd.Timestamp],
-                post_period: tuple[pd.Timestamp, pd.Timestamp],
-                holiday_flags: dict):
+    series = series.dropna()
 
-    pre_start, pre_end = pre_period
-    post_start, post_end = post_period
-
-    df = df.sort_index()
-
-    train = df.loc[pre_start:pre_end].copy()
-    full  = df.loc[pre_start:post_end].copy()
-
-    if train.empty:
-        st.error("❌ Pre-period contains no data after cleaning. Adjust your dates.")
+    if len(series) < 10:
+        st.error("❌ Not enough data to fit Prophet (need at least 10 points).")
         st.stop()
 
-    # ----- build Prophet input frames -----
-    # reset_index() makes the datetime index the FIRST column – we don't assume its name
-    train_p = train.reset_index()
-    full_p  = full.reset_index()
+    # Prepare Prophet frame
+    df_p = series.reset_index()
+    date_col_name = df_p.columns[0]
+    df_p = df_p.rename(columns={date_col_name: "ds", metric_col: "y"})
+    df_p["y"] = clean_series(df_p["y"])
 
-    date_col_name = train_p.columns[0]  # first column is the datetime after reset_index
-
-    train_p = train_p.rename(columns={date_col_name: "ds", metric_col: "y"})
-    full_p  = full_p.rename(columns={date_col_name: "ds", metric_col: "y"})
-
-    # clean KPI
-    train_p["y"] = clean_series(train_p["y"])
-    full_p["y"]  = clean_series(full_p["y"])
-
-    # prophet model
+    # Build model
     m = Prophet(
-        weekly_seasonality=True,
+        weekly_seasonality=True if horizon_unit in ["Daily", "Weekly"] else False,
         yearly_seasonality=True,
-        daily_seasonality=False
+        daily_seasonality=False,
     )
 
-    # holidays
-    hol_df = build_holidays(df.index, holiday_flags)
+    hol_df = build_holidays(series.index, holiday_flags)
     if hol_df is not None:
         m.holidays = hol_df
 
-    used_controls: list[str] = []
-
-    # add regressors safely
-    for c in control_cols:
-        if c not in df.columns:
-            continue
-
-        tr_c = clean_series(train[c])
-        fu_c = clean_series(full[c])
-
-        # if the regressor is completely flat, it's not useful
-        if tr_c.nunique() <= 1:
-            st.warning(f"⚠️ Control '{c}' has no variation and was ignored.")
-            continue
-
-        train_p[c] = tr_c.values
-        full_p[c]  = fu_c.values
-        m.add_regressor(c)
-        used_controls.append(c)
-
-    # ------------- final safety firewall before fit() -------------
-    # no duplicates on ds, no NaNs, no infs
-    num_cols = ["y"] + used_controls
-
-    train_p = (
-        train_p
-        .drop_duplicates(subset=["ds"])
-        .replace([np.inf, -np.inf], np.nan)
-        .dropna(subset=num_cols)
-        .sort_values("ds")
-    )
-
-    if len(train_p) < 14:
-        st.error("❌ Not enough clean pre-period data after processing (need ≥ 14 days).")
-        st.stop()
-
     try:
-        m.fit(train_p)  # Prophet will ignore extra columns it doesn't need
+        m.fit(df_p)
     except Exception as e:
-        st.error(f"❌ Prophet failed during model fitting: {e}")
+        st.error(f"❌ Prophet failed during fitting: {e}")
         st.stop()
 
-    # full frame for prediction
-    full_p = (
-        full_p
-        .drop_duplicates(subset=["ds"])
-        .replace([np.inf, -np.inf], np.nan)
-        .ffill()
-        .bfill()
-        .sort_values("ds")
-    )
+    future = m.make_future_dataframe(periods=horizon_len, freq=freq)
+    forecast = m.predict(future).set_index("ds")
 
-    forecast = m.predict(full_p).set_index("ds")
-
-    # merge with actuals
-    result = full[[metric_col]].join(
-        forecast[["yhat", "yhat_lower", "yhat_upper"]],
-        how="left"
-    )
-
-    # pre-period metrics
-    pre_res = result.loc[pre_start:pre_end]
-    rmse = float(np.sqrt(np.mean((pre_res[metric_col] - pre_res["yhat"]) ** 2)))
-    mape = float(
-        np.mean(np.abs((pre_res[metric_col] - pre_res["yhat"]) / pre_res[metric_col])) * 100
-    )
-
-    # post-period uplift
-    post_res = result.loc[post_start:post_end].copy()
-    post_res["impact"] = post_res[metric_col] - post_res["yhat"]
-    post_res["cum_impact"] = post_res["impact"].cumsum()
-
-    total_uplift = float(post_res["impact"].sum())
-    pred_sum = float(post_res["yhat"].sum())
-    rel_uplift_pct = float(total_uplift / pred_sum * 100) if pred_sum != 0 else np.nan
+    # Metrics on in-sample fit
+    aligned = forecast.loc[series.index]
+    rmse = float(np.sqrt(np.mean((series[metric_col] - aligned["yhat"]) ** 2)))
+    mape = float(np.mean(np.abs((series[metric_col] - aligned["yhat"]) / series[metric_col])) * 100)
 
     metrics = {
-        "Model": "Prophet",
-        "RMSE (pre)": rmse,
-        "MAPE (pre, %)": mape,
-        "Total uplift (post)": total_uplift,
-        "Relative uplift (post, %)": rel_uplift_pct,
-        "Controls used": used_controls,
+        "Model": "Prophet Forecast",
+        "Frequency": horizon_unit,
+        "Horizon length": horizon_len,
+        "RMSE (in-sample)": rmse,
+        "MAPE (in-sample, %)": mape,
     }
 
-    return result, post_res, metrics
+    return series, forecast, metrics
 
+
+def plot_prophet_forecast(history: pd.DataFrame,
+                          forecast: pd.DataFrame,
+                          metric_col: str,
+                          title: str):
+    # history index & forecast index are datetime
+    fig = go.Figure()
+
+    # Actuals
+    fig.add_trace(go.Scatter(
+        x=history.index,
+        y=history[metric_col],
+        mode="lines",
+        name="Actual"
+    ))
+
+    # Forecast mean
+    fig.add_trace(go.Scatter(
+        x=forecast.index,
+        y=forecast["yhat"],
+        mode="lines",
+        name="Forecast"
+    ))
+
+    # Uncertainty band (simple & safe)
+    if {"yhat_lower", "yhat_upper"}.issubset(forecast.columns):
+        fig.add_trace(go.Scatter(
+            x=forecast.index,
+            y=forecast["yhat_upper"],
+            mode="lines",
+            line=dict(width=0),
+            showlegend=False
+        ))
+        fig.add_trace(go.Scatter(
+            x=forecast.index,
+            y=forecast["yhat_lower"],
+            mode="lines",
+            fill="tonexty",
+            line=dict(width=0),
+            opacity=0.2,
+            name="Forecast interval"
+        ))
+
+    fig.update_layout(title=title, xaxis_title="Date", yaxis_title=metric_col)
+    return fig
 
 
 # ==========================================================
-# BSTS / CausalImpact engine
+# BSTS / CausalImpact: uplift model
 # ==========================================================
 
-def run_bsts(df: pd.DataFrame,
-             metric_col: str,
-             control_cols: list[str],
-             pre_period: tuple[pd.Timestamp, pd.Timestamp],
-             post_period: tuple[pd.Timestamp, pd.Timestamp]):
+def run_bsts_uplift(df_daily: pd.DataFrame,
+                    metric_col: str,
+                    control_cols: list[str],
+                    pre_period: tuple[pd.Timestamp, pd.Timestamp],
+                    post_period: tuple[pd.Timestamp, pd.Timestamp]):
 
     pre_start, pre_end = pre_period
     post_start, post_end = post_period
 
-    df = df.sort_index()
+    df_daily = df_daily.sort_index()
 
-    cols = [metric_col] + list(control_cols)
-    ci_df = df[cols].copy()
+    cols = [metric_col] + control_cols
+    ci_df = df_daily[cols].copy()
 
-    # clean everything
     for c in cols:
         ci_df[c] = clean_series(ci_df[c])
 
     try:
         ci = CausalImpact(ci_df, [pre_start, pre_end], [post_start, post_end])
     except Exception as e:
-        st.error(f"❌ CausalImpact failed to run on this data: {e}")
+        st.error(f"❌ CausalImpact failed to run: {e}")
         st.stop()
 
-    # some versions of causalimpact don't expose .summary_data
-    try:
+    # Try various ways to access inferences
+    sd = None
+    if hasattr(ci, "summary_data"):
         sd = ci.summary_data
-    except AttributeError:
-        st.error("❌ This CausalImpact version does not provide 'summary_data'. Try the Prophet model instead.")
+    elif hasattr(ci, "inferences"):
+        sd = ci.inferences
+    else:
+        st.error("❌ Could not access CausalImpact results structure on this environment.")
         st.stop()
 
-    rmse = float(np.sqrt(np.mean((sd["actual"] - sd["predicted"]) ** 2)))
-    mape = float(np.mean(np.abs((sd["actual"] - sd["predicted"]) / sd["actual"])) * 100)
+    # Try to map common column names
+    def pick_col(candidates):
+        for c in candidates:
+            if c in sd.columns:
+                return c
+        return None
+
+    actual_col = pick_col(["actual", "response", "y", "observed"])
+    pred_col = pick_col(["predicted", "point_pred", "prediction", "avg_pred"])
+    pe_col = pick_col(["point_effect", "point_effects", "pointEffect"])
+    ce_col = pick_col(["cum_effect", "cumulative_effect", "cum_effects"])
+
+    if actual_col is None or pred_col is None:
+        st.error("❌ Unable to interpret CausalImpact output columns for actual/predicted.")
+        st.stop()
+
+    # Basic metrics
+    rmse = float(np.sqrt(np.mean((sd[actual_col] - sd[pred_col]) ** 2)))
+    mape = float(np.mean(np.abs((sd[actual_col] - sd[pred_col]) / sd[actual_col])) * 100)
 
     post_mask = (sd.index >= post_start) & (sd.index <= post_end)
     post_sd = sd.loc[post_mask]
 
-    uplift = float(post_sd["point_effect"].sum())
-    pred_sum = float(post_sd["predicted"].sum())
+    # Uplift
+    if pe_col is not None:
+        uplift = float(post_sd[pe_col].sum())
+    else:
+        uplift = float((post_sd[actual_col] - post_sd[pred_col]).sum())
+
+    pred_sum = float(post_sd[pred_col].sum())
     rel_uplift_pct = float(uplift / pred_sum * 100) if pred_sum != 0 else np.nan
 
-    p_value = None
-    if "p_value" in sd.columns:
-        p_value = float(sd["p_value"].iloc[-1])
+    # p-value / prob if available
+    p_val = None
+    for c in ["p_value", "p", "tail_prob"]:
+        if c in sd.columns:
+            p_val = float(sd[c].iloc[-1])
+            break
 
     metrics = {
-        "Model": "BSTS / CausalImpact",
+        "Model": "BSTS / CausalImpact (uplift)",
         "RMSE": rmse,
         "MAPE (%)": mape,
         "Total uplift (post)": uplift,
         "Relative uplift (post, %)": rel_uplift_pct,
-        "p-value": p_value,
+        "p-value (if available)": p_val,
     }
 
-    return ci, sd, metrics
+    # For plotting actual vs counterfactual
+    plot_df = sd.copy()
+    plot_df = plot_df.rename(columns={
+        actual_col: "actual",
+        pred_col: "predicted"
+    })
 
-# ==========================================================
-# Plot helpers
-# ==========================================================
+    return ci, plot_df, metrics
 
-def plot_actual_vs_cf(df: pd.DataFrame, metric_col: str, title: str = "Actual vs Counterfactual"):
+
+def plot_bsts_actual_vs_cf(plot_df: pd.DataFrame, title: str):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df.index, y=df[metric_col], name="Actual"))
-    fig.add_trace(go.Scatter(x=df.index, y=df["yhat"], name="Counterfactual"))
-    if "yhat_lower" in df.columns and "yhat_upper" in df.columns:
-        fig.add_trace(go.Scatter(
-            x=pd.concat([df.index, df.index[::-1]]),
-            y=pd.concat([df["yhat_upper"], df["yhat_lower"][::-1]]),
-            fill="toself",
-            mode="lines",
-            line=dict(width=0),
-            opacity=0.2,
-            showlegend=False,
-            name="Confidence interval"
-        ))
-    fig.update_layout(title=title, xaxis_title="Date", yaxis_title=metric_col)
+    fig.add_trace(go.Scatter(
+        x=plot_df.index,
+        y=plot_df["actual"],
+        mode="lines",
+        name="Actual"
+    ))
+    fig.add_trace(go.Scatter(
+        x=plot_df.index,
+        y=plot_df["predicted"],
+        mode="lines",
+        name="Counterfactual"
+    ))
+    fig.update_layout(title=title, xaxis_title="Date", yaxis_title="Metric")
     return fig
 
 
 # ==========================================================
-# Streamlit app
+# Streamlit UI
 # ==========================================================
 
 def main():
-    st.set_page_config(layout="wide", page_title="Counterfactual Impact App")
-    st.title("📈 Counterfactual Impact App (Prophet + BSTS)")
-    st.caption("Fully error-proof. Supports CSV & Excel · Daily / Weekly / Monthly.")
+    st.set_page_config(layout="wide", page_title="Counterfactual / Forecast App")
+    st.title("📈 Counterfactual & Forecast App")
+    st.caption("Prophet for pure forecast · BSTS (CausalImpact) for uplift.")
 
-    # -------------------------------
-    # File upload (CSV or Excel)
-    # -------------------------------
+    # ------------- File upload -------------
     uploaded = st.sidebar.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
-
     if not uploaded:
         st.info("👈 Upload a CSV or Excel file to begin.")
         st.stop()
 
-    file_ext = Path(uploaded.name).suffix.lower()
-
-    # Excel: let user choose sheet
-    if file_ext in [".xlsx", ".xls"]:
+    ext = Path(uploaded.name).suffix.lower()
+    if ext in [".xlsx", ".xls"]:
         try:
             xl = pd.ExcelFile(uploaded)
         except Exception as e:
             st.error(f"❌ Failed to read Excel file: {e}")
             st.stop()
-
-        sheet_name = st.sidebar.selectbox("Select worksheet", xl.sheet_names)
-        df = xl.parse(sheet_name)
+        sheet = st.sidebar.selectbox("Worksheet", xl.sheet_names)
+        df = xl.parse(sheet)
     else:
-        # CSV
         try:
             df = pd.read_csv(uploaded)
         except Exception as e:
@@ -384,77 +369,108 @@ def main():
             st.stop()
 
     if df.empty:
-        st.error("❌ Uploaded file appears to be empty.")
+        st.error("❌ Uploaded file is empty.")
         st.stop()
 
-    st.subheader("Data Preview")
+    st.subheader("Data preview")
     st.dataframe(df.head())
 
-    # -------------------------------
-    # Column & frequency selection
-    # -------------------------------
+    # ------------- Basic column selection -------------
     date_col = st.sidebar.selectbox("Date column", df.columns)
 
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if not numeric_cols:
-        st.error("❌ No numeric columns found for KPI. Please check your data.")
+        st.error("❌ No numeric columns found for KPI.")
         st.stop()
 
     metric_col = st.sidebar.selectbox("Metric (KPI)", numeric_cols)
+    control_candidates = [c for c in df.columns if c not in [metric_col, date_col]]
+    control_cols = st.sidebar.multiselect("Control variables (for BSTS uplift)", control_candidates)
 
-    control_candidates = [c for c in df.columns if c != metric_col and c != date_col]
-    control_cols = st.sidebar.multiselect("Control variables (optional)", control_candidates)
-
-    freq_choice = st.sidebar.radio("Data frequency (as uploaded)", ["Daily", "Weekly", "Monthly"])
     agg_method = st.sidebar.radio("If duplicate dates exist, aggregate using:", ["mean", "sum", "first"])
 
-    # -------------------------------
-    # Resample to daily
-    # -------------------------------
-    df_daily = resample_to_daily(df, date_col, freq_choice, agg_method)
+    # Standardize to daily
+    df_daily = standardize_to_daily(df, date_col, agg_method)
 
     min_ts, max_ts = df_daily.index.min(), df_daily.index.max()
-    min_date, max_date = min_ts.date(), max_ts.date()
+    min_d, max_d = min_ts.date(), max_ts.date()
 
-    if (max_ts - min_ts).days < 1:
-        st.error("❌ Not enough date span in data. Need at least 2 days.")
+    # ------------- Model choice -------------
+    model_choice = st.sidebar.radio("Model", ["Prophet forecast", "BSTS uplift"])
+
+    # ------------- Prophet UI -------------
+    if model_choice == "Prophet forecast":
+        st.sidebar.markdown("### Prophet Forecast Settings")
+        granularity = st.sidebar.radio("Forecast granularity", ["Daily", "Weekly", "Monthly"])
+
+        if granularity == "Daily":
+            max_len = 365
+            default_len = 30
+        elif granularity == "Weekly":
+            max_len = 104
+            default_len = 12
+        else:
+            max_len = 36
+            default_len = 6
+
+        horizon_len = st.sidebar.slider("Forecast length", min_value=1, max_value=max_len, value=default_len)
+
+        st.sidebar.markdown("### Holidays")
+        holiday_flags = {
+            "Christmas": st.sidebar.checkbox("Christmas", True),
+            "Black Friday": st.sidebar.checkbox("Black Friday", True),
+            "Easter": st.sidebar.checkbox("Easter", True),
+            "Cyber Monday": st.sidebar.checkbox("Cyber Monday", True),
+        }
+
+        if st.sidebar.button("🚀 Run Prophet forecast"):
+            history, forecast, metrics = run_prophet_forecast(
+                df_daily,
+                metric_col=metric_col,
+                horizon_len=horizon_len,
+                horizon_unit=granularity,
+                holiday_flags=holiday_flags
+            )
+
+            st.subheader("Prophet Forecast Results")
+            st.json(metrics)
+            fig = plot_prophet_forecast(history, forecast, metric_col, "Prophet forecast")
+            st.plotly_chart(fig, use_container_width=True)
+
         st.stop()
 
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### Periods")
+    # ------------- BSTS UI -------------
+    st.sidebar.markdown("### BSTS Uplift Settings")
 
+    # Default pre/post partition: 70% pre, 30% post
     span_days = (max_ts - min_ts).days
-    default_pre_end = min_date + timedelta(days=max(13, span_days // 2))
-    if default_pre_end > max_date:
-        default_pre_end = max_date
+    default_pre_end = min_d + timedelta(days=int(span_days * 0.7))
+    if default_pre_end >= max_d:
+        default_pre_end = max_d - timedelta(days=1)
+    default_post_start = default_pre_end + timedelta(days=1)
 
-    default_post_start = min(default_pre_end + timedelta(days=1), max_date)
-
-    pre_period_input = st.sidebar.date_input(
+    pre_input = st.sidebar.date_input(
         "Pre-period (training)",
-        value=(min_date, default_pre_end),
-        min_value=min_date,
-        max_value=max_date
+        value=(min_d, default_pre_end),
+        min_value=min_d,
+        max_value=max_d
     )
-
-    post_period_input = st.sidebar.date_input(
+    post_input = st.sidebar.date_input(
         "Post-period (intervention)",
-        value=(default_post_start, max_date),
-        min_value=min_date,
-        max_value=max_date
+        value=(default_post_start, max_d),
+        min_value=min_d,
+        max_value=max_d
     )
 
-    if not isinstance(pre_period_input, (list, tuple)) or len(pre_period_input) != 2:
-        st.error("❌ Please select a start and end date for the pre-period.")
+    if not isinstance(pre_input, (list, tuple)) or len(pre_input) != 2:
+        st.error("❌ Select both start and end for pre-period.")
         st.stop()
-    if not isinstance(post_period_input, (list, tuple)) or len(post_period_input) != 2:
-        st.error("❌ Please select a start and end date for the post-period.")
+    if not isinstance(post_input, (list, tuple)) or len(post_input) != 2:
+        st.error("❌ Select both start and end for post-period.")
         st.stop()
 
-    pre_start = pd.Timestamp(pre_period_input[0])
-    pre_end = pd.Timestamp(pre_period_input[1])
-    post_start = pd.Timestamp(post_period_input[0])
-    post_end = pd.Timestamp(post_period_input[1])
+    pre_start, pre_end = map(pd.Timestamp, pre_input)
+    post_start, post_end = map(pd.Timestamp, post_input)
 
     if pre_start >= pre_end:
         st.error("❌ Pre-period start must be before pre-period end.")
@@ -463,44 +479,11 @@ def main():
         st.error("❌ Post-period start must be before post-period end.")
         st.stop()
     if pre_end >= post_start:
-        st.error("❌ Pre-period must end *before* post-period begins.")
+        st.error("❌ Pre-period must end before post-period starts.")
         st.stop()
 
-    model_choice = st.sidebar.radio("Model", ["Prophet", "BSTS / CausalImpact"])
-
-    st.sidebar.markdown("### Holidays / High Demand")
-    holiday_flags = {
-        "Christmas": st.sidebar.checkbox("Christmas", True),
-        "Black Friday": st.sidebar.checkbox("Black Friday", True),
-        "Easter": st.sidebar.checkbox("Easter", True),
-        "Cyber Monday": st.sidebar.checkbox("Cyber Monday", True),
-    }
-
-    run_btn = st.sidebar.button("🚀 Run model")
-
-    if not run_btn:
-        st.stop()
-
-    # -------------------------------
-    # Run selected model
-    # -------------------------------
-    if model_choice == "Prophet":
-        st.subheader("Prophet Counterfactual Results")
-        res_df, post_df, metrics = run_prophet(
-            df_daily,
-            metric_col=metric_col,
-            control_cols=control_cols,
-            pre_period=(pre_start, pre_end),
-            post_period=(post_start, post_end),
-            holiday_flags=holiday_flags
-        )
-
-        st.json(metrics)
-        st.plotly_chart(plot_actual_vs_cf(res_df, metric_col), use_container_width=True)
-
-    else:
-        st.subheader("BSTS / CausalImpact Results")
-        ci, sd, metrics = run_bsts(
+    if st.sidebar.button("🚀 Run BSTS uplift"):
+        ci, plot_df, metrics = run_bsts_uplift(
             df_daily,
             metric_col=metric_col,
             control_cols=control_cols,
@@ -508,14 +491,16 @@ def main():
             post_period=(post_start, post_end)
         )
 
+        st.subheader("BSTS / CausalImpact Results")
         st.json(metrics)
+        fig = plot_bsts_actual_vs_cf(plot_df, "Actual vs counterfactual (BSTS)")
+        st.plotly_chart(fig, use_container_width=True)
 
-        # Plot using summary_data (rename columns)
-        plot_df = sd.rename(columns={"actual": metric_col, "predicted": "yhat"})
-        st.plotly_chart(plot_actual_vs_cf(plot_df, metric_col), use_container_width=True)
-
-        st.markdown("**CausalImpact summary**")
-        st.text(ci.summary())
+        st.markdown("**CausalImpact textual summary (if available)**")
+        try:
+            st.text(ci.summary())
+        except Exception:
+            st.text("Summary not available on this CausalImpact build.")
 
 
 if __name__ == "__main__":
