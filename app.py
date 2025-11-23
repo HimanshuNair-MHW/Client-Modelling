@@ -11,7 +11,7 @@ from dateutil.easter import easter as easter_sunday
 
 
 # ==========================================================
-# Helpers: date + cleaning
+# Helpers: date parsing + cleaning
 # ==========================================================
 
 def standardize_to_daily(df: pd.DataFrame,
@@ -103,7 +103,7 @@ def build_holidays(index: pd.DatetimeIndex, flags: dict) -> pd.DataFrame | None:
 
 
 # ==========================================================
-# Prophet: pure forecast (no uplift)
+# PROPHET: pure forecast (version 2) with fit metrics
 # ==========================================================
 
 def run_prophet_forecast(df_daily: pd.DataFrame,
@@ -114,6 +114,7 @@ def run_prophet_forecast(df_daily: pd.DataFrame,
     """
     df_daily: daily-indexed dataframe with metric_col
     horizon_unit: 'Daily', 'Weekly', 'Monthly'
+    Returns: (history_series, full_forecast_df, metrics_dict)
     """
 
     df_daily = df_daily.sort_index()
@@ -164,8 +165,15 @@ def run_prophet_forecast(df_daily: pd.DataFrame,
 
     # Metrics on in-sample fit
     aligned = forecast.loc[series.index]
-    rmse = float(np.sqrt(np.mean((series[metric_col] - aligned["yhat"]) ** 2)))
-    mape = float(np.mean(np.abs((series[metric_col] - aligned["yhat"]) / series[metric_col])) * 100)
+    actual = series[metric_col]
+    pred = aligned["yhat"]
+
+    rmse = float(np.sqrt(np.mean((actual - pred) ** 2)))
+    mape = float(
+        np.mean(
+            np.abs((actual - pred) / np.where(actual != 0, actual, np.nan))
+        ) * 100
+    )
 
     metrics = {
         "Model": "Prophet Forecast",
@@ -182,10 +190,9 @@ def plot_prophet_forecast(history: pd.DataFrame,
                           forecast: pd.DataFrame,
                           metric_col: str,
                           title: str):
-    # history index & forecast index are datetime
     fig = go.Figure()
 
-    # Actuals
+    # Actuals (history only)
     fig.add_trace(go.Scatter(
         x=history.index,
         y=history[metric_col],
@@ -193,7 +200,7 @@ def plot_prophet_forecast(history: pd.DataFrame,
         name="Actual"
     ))
 
-    # Forecast mean
+    # Forecast mean (includes history & future)
     fig.add_trace(go.Scatter(
         x=forecast.index,
         y=forecast["yhat"],
@@ -201,7 +208,7 @@ def plot_prophet_forecast(history: pd.DataFrame,
         name="Forecast"
     ))
 
-    # Uncertainty band (simple & safe)
+    # Uncertainty band (simple + safe)
     if {"yhat_lower", "yhat_upper"}.issubset(forecast.columns):
         fig.add_trace(go.Scatter(
             x=forecast.index,
@@ -225,8 +232,63 @@ def plot_prophet_forecast(history: pd.DataFrame,
 
 
 # ==========================================================
-# BSTS / CausalImpact: uplift model
+# BSTS / CausalImpact: uplift model (requires controls)
 # ==========================================================
+
+def _standardise_ci_summary(sd_raw, index_for_df):
+    """
+    Convert various possible CausalImpact summary_data / inferences
+    objects into a DataFrame with at least:
+      - 'actual'
+      - 'predicted'
+    and ideally:
+      - 'point_effect'
+    """
+    # Case 1: already a DataFrame
+    if isinstance(sd_raw, pd.DataFrame):
+        df_sd = sd_raw.copy()
+    else:
+        # Try Series or array-like
+        arr = np.asarray(sd_raw)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        cols = [f"col{i}" for i in range(arr.shape[1])]
+        df_sd = pd.DataFrame(arr, index=index_for_df, columns=cols)
+
+    # Try to detect columns
+    def find_col(candidates):
+        for c in df_sd.columns:
+            lc = c.lower()
+            if any(term in lc for term in candidates):
+                return c
+        return None
+
+    actual_col = find_col(["actual", "response", "observed", "y"])
+    pred_col = find_col(["pred", "forecast", "expected", "mean"])
+    effect_col = find_col(["effect"])
+
+    if actual_col is None or pred_col is None:
+        # Fallback: first two columns
+        if len(df_sd.columns) >= 2:
+            actual_col = df_sd.columns[0]
+            pred_col = df_sd.columns[1]
+        else:
+            st.error("❌ Unexpected CausalImpact output: cannot identify actual & predicted.")
+            st.stop()
+
+    df_std = pd.DataFrame({
+        "actual": df_sd[actual_col],
+        "predicted": df_sd[pred_col]
+    })
+
+    # Add effect column if we can
+    if effect_col is not None:
+        df_std["point_effect"] = df_sd[effect_col]
+    elif len(df_sd.columns) >= 3:
+        df_std["point_effect"] = df_sd.iloc[:, 2]
+
+    return df_std
+
 
 def run_bsts_uplift(df_daily: pd.DataFrame,
                     metric_col: str,
@@ -239,6 +301,11 @@ def run_bsts_uplift(df_daily: pd.DataFrame,
 
     df_daily = df_daily.sort_index()
 
+    # Need at least one control for BSTS
+    if len(control_cols) == 0:
+        st.error("❌ BSTS uplift requires at least one control variable.")
+        st.stop()
+
     cols = [metric_col] + control_cols
     ci_df = df_daily[cols].copy()
 
@@ -246,93 +313,81 @@ def run_bsts_uplift(df_daily: pd.DataFrame,
         ci_df[c] = clean_series(ci_df[c])
 
     try:
-        ci = CausalImpact(ci_df, [pre_start, pre_end], [post_start, post_end])
+        ci = CausalImpact(ci_df, (pre_start, pre_end), (post_start, post_end))
     except Exception as e:
         st.error(f"❌ CausalImpact failed to run: {e}")
         st.stop()
 
-    # Try various ways to access inferences
-    sd = None
-    if hasattr(ci, "summary_data"):
-        sd = ci.summary_data
-    elif hasattr(ci, "inferences"):
-        sd = ci.inferences
-    else:
-        st.error("❌ Could not access CausalImpact results structure on this environment.")
+    # Try different attributes for CI output
+    sd_raw = getattr(ci, "summary_data", None)
+    if sd_raw is None:
+        sd_raw = getattr(ci, "inferences", None)
+    if sd_raw is None:
+        st.error("❌ Could not read CausalImpact output (no summary_data / inferences).")
         st.stop()
 
-       # Standardize output format
-    if isinstance(sd, pd.DataFrame):
-        # Rename actual & predicted if possible
-        rename_map = {}
-        for alias in ["actual", "response", "y", "observed"]:
-            if alias in sd.columns:
-                rename_map[alias] = "actual"
-        for alias in ["predicted", "point_pred", "prediction", "avg_pred"]:
-            if alias in sd.columns:
-                rename_map[alias] = "predicted"
-        sd = sd.rename(columns=rename_map)
-
-        if "actual" not in sd.columns or "predicted" not in sd.columns:
-            st.error("❌ CausalImpact output missing actual/predicted columns.")
-            st.stop()
-
-    else:
-        # NumPy fallback
-        arr = np.asarray(sd)
-        if arr.ndim != 2 or arr.shape[1] < 3:
-            st.error("❌ Unexpected CausalImpact output format.")
-            st.stop()
-
-        # Build a DataFrame with the standard column names
-        names = ["actual", "predicted", "point_effect"]
-        if arr.shape[1] >= 4:
-            names.append("cum_effect")
-
-        sd = pd.DataFrame(arr, index=ci_df.index, columns=names)
+    sd = _standardise_ci_summary(sd_raw, ci_df.index)
 
     # Metrics
     actual = sd["actual"]
     pred = sd["predicted"]
+
     rmse = float(np.sqrt(np.mean((actual - pred) ** 2)))
-    mape = float(np.mean(np.abs((actual - pred) / actual)) * 100)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mape = float(
+            np.nanmean(
+                np.abs((actual - pred) / np.where(actual != 0, actual, np.nan))
+            ) * 100
+        )
 
+    # Post-period uplift
     post_mask = (sd.index >= post_start) & (sd.index <= post_end)
-    post_sd = sd.loc[post_mask]
+    sd_post = sd.loc[post_mask]
 
-    uplift = float(post_sd.get("point_effect", actual - pred).sum())
-    pred_sum = float(post_sd["predicted"].sum())
-    rel_uplift_pct = float(uplift / pred_sum * 100) if pred_sum != 0 else np.nan
+    uplift = float((sd_post["actual"] - sd_post["predicted"]).sum())
+    pred_sum = float(sd_post["predicted"].sum())
+    rel_uplift_pct = uplift / pred_sum * 100 if pred_sum != 0 else np.nan
 
+    # p-value (if present)
     p_val = None
-    for c in ["p_value", "p", "tail_prob"]:
-        if c in sd.columns:
-            p_val = float(sd[c].iloc[-1])
+    for cand in ["p_value", "p", "tail_prob"]:
+        if cand in sd.columns:
+            p_val = float(sd[cand].iloc[-1])
             break
 
     metrics = {
         "Model": "BSTS / CausalImpact (uplift)",
-        "RMSE": rmse,
-        "MAPE (%)": mape,
+        "RMSE (overall)": rmse,
+        "MAPE (overall, %)": mape,
         "Total uplift (post)": uplift,
         "Relative uplift (post, %)": rel_uplift_pct,
         "p-value (if available)": p_val,
+        "Controls used": control_cols,
     }
 
-    return ci, sd, metrics
+    # For plotting: actual vs predicted
+    plot_df = pd.DataFrame({
+        "Actual": actual,
+        "Predicted": pred
+    })
+
+    if "point_effect" in sd.columns:
+        plot_df["Effect"] = sd["point_effect"]
+
+    return ci, plot_df, metrics
 
 
 def plot_bsts_actual_vs_cf(plot_df: pd.DataFrame, title: str):
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=plot_df.index,
-        y=plot_df["actual"],
+        y=plot_df["Actual"],
         mode="lines",
         name="Actual"
     ))
     fig.add_trace(go.Scatter(
         x=plot_df.index,
-        y=plot_df["predicted"],
+        y=plot_df["Predicted"],
         mode="lines",
         name="Counterfactual"
     ))
@@ -341,15 +396,15 @@ def plot_bsts_actual_vs_cf(plot_df: pd.DataFrame, title: str):
 
 
 # ==========================================================
-# Streamlit UI
+# STREAMLIT APP
 # ==========================================================
 
 def main():
-    st.set_page_config(layout="wide", page_title="Counterfactual / Forecast App")
-    st.title("📈 Counterfactual & Forecast App")
-    st.caption("Prophet for pure forecast · BSTS (CausalImpact) for uplift.")
+    st.set_page_config(layout="wide", page_title="Forecast & Uplift App")
+    st.title("📈 Forecast & Uplift App")
+    st.caption("Prophet for pure forecast · BSTS (CausalImpact) for uplift with controls.")
 
-    # ------------- File upload -------------
+    # ---------- File upload ----------
     uploaded = st.sidebar.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
     if not uploaded:
         st.info("👈 Upload a CSV or Excel file to begin.")
@@ -378,7 +433,7 @@ def main():
     st.subheader("Data preview")
     st.dataframe(df.head())
 
-    # ------------- Basic column selection -------------
+    # ---------- Column selection ----------
     date_col = st.sidebar.selectbox("Date column", df.columns)
 
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -392,16 +447,16 @@ def main():
 
     agg_method = st.sidebar.radio("If duplicate dates exist, aggregate using:", ["mean", "sum", "first"])
 
-    # Standardize to daily
+    # Standardize to daily index
     df_daily = standardize_to_daily(df, date_col, agg_method)
 
     min_ts, max_ts = df_daily.index.min(), df_daily.index.max()
     min_d, max_d = min_ts.date(), max_ts.date()
 
-    # ------------- Model choice -------------
+    # ---------- Model choice ----------
     model_choice = st.sidebar.radio("Model", ["Prophet forecast", "BSTS uplift"])
 
-    # ------------- Prophet UI -------------
+    # ---------- Prophet forecast UI ----------
     if model_choice == "Prophet forecast":
         st.sidebar.markdown("### Prophet Forecast Settings")
         granularity = st.sidebar.radio("Forecast granularity", ["Daily", "Weekly", "Monthly"])
@@ -416,7 +471,12 @@ def main():
             max_len = 36
             default_len = 6
 
-        horizon_len = st.sidebar.slider("Forecast length", min_value=1, max_value=max_len, value=default_len)
+        horizon_len = st.sidebar.slider(
+            "Forecast length",
+            min_value=1,
+            max_value=max_len,
+            value=default_len
+        )
 
         st.sidebar.markdown("### Holidays")
         holiday_flags = {
@@ -442,10 +502,9 @@ def main():
 
         st.stop()
 
-    # ------------- BSTS UI -------------
+    # ---------- BSTS uplift UI ----------
     st.sidebar.markdown("### BSTS Uplift Settings")
 
-    # Default pre/post partition: 70% pre, 30% post
     span_days = (max_ts - min_ts).days
     default_pre_end = min_d + timedelta(days=int(span_days * 0.7))
     if default_pre_end >= max_d:
@@ -494,9 +553,9 @@ def main():
             post_period=(post_start, post_end)
         )
 
-        st.subheader("BSTS / CausalImpact Results")
+        st.subheader("BSTS / CausalImpact Uplift Results")
         st.json(metrics)
-        fig = plot_bsts_actual_vs_cf(plot_df, "Actual vs counterfactual (BSTS)")
+        fig = plot_bsts_actual_vs_cf(plot_df, "Actual vs counterfactual (BSTS uplift)")
         st.plotly_chart(fig, use_container_width=True)
 
         st.markdown("**CausalImpact textual summary (if available)**")
