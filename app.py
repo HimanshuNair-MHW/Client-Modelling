@@ -261,39 +261,49 @@ def run_bsts_uplift(df_daily: pd.DataFrame,
         st.error("❌ Could not access CausalImpact results structure on this environment.")
         st.stop()
 
-    # Try to map common column names
-    def pick_col(candidates):
-        for c in candidates:
-            if c in sd.columns:
-                return c
-        return None
+       # Standardize output format
+    if isinstance(sd, pd.DataFrame):
+        # Rename actual & predicted if possible
+        rename_map = {}
+        for alias in ["actual", "response", "y", "observed"]:
+            if alias in sd.columns:
+                rename_map[alias] = "actual"
+        for alias in ["predicted", "point_pred", "prediction", "avg_pred"]:
+            if alias in sd.columns:
+                rename_map[alias] = "predicted"
+        sd = sd.rename(columns=rename_map)
 
-    actual_col = pick_col(["actual", "response", "y", "observed"])
-    pred_col = pick_col(["predicted", "point_pred", "prediction", "avg_pred"])
-    pe_col = pick_col(["point_effect", "point_effects", "pointEffect"])
-    ce_col = pick_col(["cum_effect", "cumulative_effect", "cum_effects"])
+        if "actual" not in sd.columns or "predicted" not in sd.columns:
+            st.error("❌ CausalImpact output missing actual/predicted columns.")
+            st.stop()
 
-    if actual_col is None or pred_col is None:
-        st.error("❌ Unable to interpret CausalImpact output columns for actual/predicted.")
-        st.stop()
+    else:
+        # NumPy fallback
+        arr = np.asarray(sd)
+        if arr.ndim != 2 or arr.shape[1] < 3:
+            st.error("❌ Unexpected CausalImpact output format.")
+            st.stop()
 
-    # Basic metrics
-    rmse = float(np.sqrt(np.mean((sd[actual_col] - sd[pred_col]) ** 2)))
-    mape = float(np.mean(np.abs((sd[actual_col] - sd[pred_col]) / sd[actual_col])) * 100)
+        # Build a DataFrame with the standard column names
+        names = ["actual", "predicted", "point_effect"]
+        if arr.shape[1] >= 4:
+            names.append("cum_effect")
+
+        sd = pd.DataFrame(arr, index=ci_df.index, columns=names)
+
+    # Metrics
+    actual = sd["actual"]
+    pred = sd["predicted"]
+    rmse = float(np.sqrt(np.mean((actual - pred) ** 2)))
+    mape = float(np.mean(np.abs((actual - pred) / actual)) * 100)
 
     post_mask = (sd.index >= post_start) & (sd.index <= post_end)
     post_sd = sd.loc[post_mask]
 
-    # Uplift
-    if pe_col is not None:
-        uplift = float(post_sd[pe_col].sum())
-    else:
-        uplift = float((post_sd[actual_col] - post_sd[pred_col]).sum())
-
-    pred_sum = float(post_sd[pred_col].sum())
+    uplift = float(post_sd.get("point_effect", actual - pred).sum())
+    pred_sum = float(post_sd["predicted"].sum())
     rel_uplift_pct = float(uplift / pred_sum * 100) if pred_sum != 0 else np.nan
 
-    # p-value / prob if available
     p_val = None
     for c in ["p_value", "p", "tail_prob"]:
         if c in sd.columns:
@@ -309,14 +319,7 @@ def run_bsts_uplift(df_daily: pd.DataFrame,
         "p-value (if available)": p_val,
     }
 
-    # For plotting actual vs counterfactual
-    plot_df = sd.copy()
-    plot_df = plot_df.rename(columns={
-        actual_col: "actual",
-        pred_col: "predicted"
-    })
-
-    return ci, plot_df, metrics
+    return ci, sd, metrics
 
 
 def plot_bsts_actual_vs_cf(plot_df: pd.DataFrame, title: str):
