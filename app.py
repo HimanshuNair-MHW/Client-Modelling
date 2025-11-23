@@ -141,61 +141,67 @@ def run_prophet(df: pd.DataFrame,
     df = df.sort_index()
 
     train = df.loc[pre_start:pre_end].copy()
-    full = df.loc[pre_start:post_end].copy()
+    full  = df.loc[pre_start:post_end].copy()
 
     if train.empty:
         st.error("❌ Pre-period contains no data after cleaning. Adjust your dates.")
         st.stop()
 
-    # Build Prophet-friendly dataframes
-    train_p = train.reset_index().rename(columns={"index": "ds", metric_col: "y"})
-    full_p = full.reset_index().rename(columns={"index": "ds", metric_col: "y"})
+    # ----- build Prophet input frames -----
+    # reset_index() makes the datetime index the FIRST column – we don't assume its name
+    train_p = train.reset_index()
+    full_p  = full.reset_index()
 
-    # Clean KPI
+    date_col_name = train_p.columns[0]  # first column is the datetime after reset_index
+
+    train_p = train_p.rename(columns={date_col_name: "ds", metric_col: "y"})
+    full_p  = full_p.rename(columns={date_col_name: "ds", metric_col: "y"})
+
+    # clean KPI
     train_p["y"] = clean_series(train_p["y"])
-    full_p["y"] = clean_series(full_p["y"])
+    full_p["y"]  = clean_series(full_p["y"])
 
-    # Prophet model
+    # prophet model
     m = Prophet(
         weekly_seasonality=True,
         yearly_seasonality=True,
         daily_seasonality=False
     )
 
-    # Holidays
+    # holidays
     hol_df = build_holidays(df.index, holiday_flags)
     if hol_df is not None:
         m.holidays = hol_df
 
     used_controls: list[str] = []
 
-    # Add regressors
+    # add regressors safely
     for c in control_cols:
-        if c not in train.columns:
+        if c not in df.columns:
             continue
 
         tr_c = clean_series(train[c])
         fu_c = clean_series(full[c])
 
-        # If no variation, skip
+        # if the regressor is completely flat, it's not useful
         if tr_c.nunique() <= 1:
             st.warning(f"⚠️ Control '{c}' has no variation and was ignored.")
             continue
 
         train_p[c] = tr_c.values
-        full_p[c] = fu_c.values
+        full_p[c]  = fu_c.values
         m.add_regressor(c)
         used_controls.append(c)
 
-    # -------------------------------
-    # FINAL SAFETY FIREWALL (key bit)
-    # -------------------------------
-    # Drop duplicate ds, any NaNs/Inf, sort
+    # ------------- final safety firewall before fit() -------------
+    # no duplicates on ds, no NaNs, no infs
+    num_cols = ["y"] + used_controls
+
     train_p = (
         train_p
         .drop_duplicates(subset=["ds"])
         .replace([np.inf, -np.inf], np.nan)
-        .dropna()
+        .dropna(subset=num_cols)
         .sort_values("ds")
     )
 
@@ -203,14 +209,13 @@ def run_prophet(df: pd.DataFrame,
         st.error("❌ Not enough clean pre-period data after processing (need ≥ 14 days).")
         st.stop()
 
-    # Fit Prophet safely
     try:
-        m.fit(train_p)
+        m.fit(train_p)  # Prophet will ignore extra columns it doesn't need
     except Exception as e:
         st.error(f"❌ Prophet failed during model fitting: {e}")
         st.stop()
 
-    # Prepare full_p for prediction (keep all dates, but clean regressors again)
+    # full frame for prediction
     full_p = (
         full_p
         .drop_duplicates(subset=["ds"])
@@ -222,25 +227,27 @@ def run_prophet(df: pd.DataFrame,
 
     forecast = m.predict(full_p).set_index("ds")
 
-    # Merge forecast with actuals
+    # merge with actuals
     result = full[[metric_col]].join(
         forecast[["yhat", "yhat_lower", "yhat_upper"]],
         how="left"
     )
 
-    # Pre-period fit metrics
+    # pre-period metrics
     pre_res = result.loc[pre_start:pre_end]
     rmse = float(np.sqrt(np.mean((pre_res[metric_col] - pre_res["yhat"]) ** 2)))
-    mape = float(np.mean(np.abs((pre_res[metric_col] - pre_res["yhat"]) / pre_res[metric_col])) * 100)
+    mape = float(
+        np.mean(np.abs((pre_res[metric_col] - pre_res["yhat"]) / pre_res[metric_col])) * 100
+    )
 
-    # Post-period uplift
+    # post-period uplift
     post_res = result.loc[post_start:post_end].copy()
     post_res["impact"] = post_res[metric_col] - post_res["yhat"]
     post_res["cum_impact"] = post_res["impact"].cumsum()
 
     total_uplift = float(post_res["impact"].sum())
-    total_pred = float(post_res["yhat"].sum()) if post_res["yhat"].sum() != 0 else np.nan
-    rel_uplift_pct = float(total_uplift / total_pred * 100) if total_pred not in [0, np.nan] else np.nan
+    pred_sum = float(post_res["yhat"].sum())
+    rel_uplift_pct = float(total_uplift / pred_sum * 100) if pred_sum != 0 else np.nan
 
     metrics = {
         "Model": "Prophet",
@@ -252,6 +259,7 @@ def run_prophet(df: pd.DataFrame,
     }
 
     return result, post_res, metrics
+
 
 
 # ==========================================================
@@ -272,17 +280,22 @@ def run_bsts(df: pd.DataFrame,
     cols = [metric_col] + list(control_cols)
     ci_df = df[cols].copy()
 
-    # Clean everything
+    # clean everything
     for c in cols:
         ci_df[c] = clean_series(ci_df[c])
 
     try:
         ci = CausalImpact(ci_df, [pre_start, pre_end], [post_start, post_end])
     except Exception as e:
-        st.error(f"❌ CausalImpact failed to run: {e}")
+        st.error(f"❌ CausalImpact failed to run on this data: {e}")
         st.stop()
 
-    sd = ci.summary_data
+    # some versions of causalimpact don't expose .summary_data
+    try:
+        sd = ci.summary_data
+    except AttributeError:
+        st.error("❌ This CausalImpact version does not provide 'summary_data'. Try the Prophet model instead.")
+        st.stop()
 
     rmse = float(np.sqrt(np.mean((sd["actual"] - sd["predicted"]) ** 2)))
     mape = float(np.mean(np.abs((sd["actual"] - sd["predicted"]) / sd["actual"])) * 100)
@@ -292,7 +305,7 @@ def run_bsts(df: pd.DataFrame,
 
     uplift = float(post_sd["point_effect"].sum())
     pred_sum = float(post_sd["predicted"].sum())
-    rel_uplift_pct = float(uplift / pred_sum * 100) if pred_sum not in [0, np.nan] else np.nan
+    rel_uplift_pct = float(uplift / pred_sum * 100) if pred_sum != 0 else np.nan
 
     p_value = None
     if "p_value" in sd.columns:
@@ -308,7 +321,6 @@ def run_bsts(df: pd.DataFrame,
     }
 
     return ci, sd, metrics
-
 
 # ==========================================================
 # Plot helpers
